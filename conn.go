@@ -261,7 +261,6 @@ func (l *Conn) reader() {
 			l.Debug.Printf("reader: %s", err.Error())
 			return
 		}
-		addLDAPDescriptions(packet)
 		message := &messagePacket{
 			Op:        MessageResponse,
 			MessageID: packet.Children[0].Value.(uint64),
