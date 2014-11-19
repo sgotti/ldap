@@ -7,6 +7,7 @@ package ldap
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -30,17 +31,20 @@ type messagePacket struct {
 
 // Conn represents an LDAP Connection
 type Conn struct {
-	conn          net.Conn
-	isTLS         bool
-	isClosing     bool
-	Debug         debugging
-	chanConfirm   chan bool
-	chanResults   map[uint64]chan *ber.Packet
-	chanMessage   chan *messagePacket
-	chanMessageID chan uint64
-	wgSender      sync.WaitGroup
-	wgClose       sync.WaitGroup
-	once          sync.Once
+	conn                     net.Conn
+	isTLS                    bool
+	isClosing                bool
+	isStartingTLS            bool
+	Debug                    debugging
+	chanConfirm              chan bool
+	chanResults              map[uint64]chan *ber.Packet
+	chanMessage              chan *messagePacket
+	chanMessageID            chan uint64
+	wgSender                 sync.WaitGroup
+	wgClose                  sync.WaitGroup
+	once                     sync.Once
+	outstandingRequests      uint
+	outstandingRequestsMutex sync.Mutex
 }
 
 // Dial connects to the given address on the given network using net.Dial
@@ -107,6 +111,24 @@ func (l *Conn) Close() {
 	l.wgClose.Wait()
 }
 
+func (l *Conn) incOutstandingRequests() {
+	l.outstandingRequestsMutex.Lock()
+	defer l.outstandingRequestsMutex.Unlock()
+	l.outstandingRequests++
+}
+
+func (l *Conn) decOutstandingRequests() {
+	l.outstandingRequestsMutex.Lock()
+	defer l.outstandingRequestsMutex.Unlock()
+	l.outstandingRequests--
+}
+
+func (l *Conn) getOutstandingRequests() uint {
+	l.outstandingRequestsMutex.Lock()
+	defer l.outstandingRequestsMutex.Unlock()
+	return l.outstandingRequests
+}
+
 // Returns the next available messageID
 func (l *Conn) nextMessageID() uint64 {
 	if l.chanMessageID != nil {
@@ -119,6 +141,10 @@ func (l *Conn) nextMessageID() uint64 {
 
 // StartTLS sends the command to start a TLS session and then creates a new TLS Client
 func (l *Conn) StartTLS(config *tls.Config) error {
+	if l.getOutstandingRequests() != 0 {
+		return NewError(ErrorNetwork, errors.New("ldap: cannot StartTLS with outstanding requests"))
+	}
+
 	messageID := l.nextMessageID()
 
 	if l.isTLS {
@@ -132,18 +158,25 @@ func (l *Conn) StartTLS(config *tls.Config) error {
 	packet.AppendChild(request)
 	l.Debug.PrintPacket(packet)
 
-	_, err := l.conn.Write(packet.Bytes())
+	channel, err := l.sendMessage(packet)
 	if err != nil {
-		return NewError(ErrorNetwork, err)
+		return err
+	}
+	l.isStartingTLS = true
+	if channel == nil {
+		l.isStartingTLS = false
+		return NewError(ErrorNetwork, errors.New("ldap: could not send message"))
 	}
 
-	packet, err = ber.ReadPacket(l.conn)
-	if err != nil {
-		return NewError(ErrorNetwork, err)
-	}
+	l.Debug.Printf("%d: waiting for response", messageID)
+	packet = <-channel
+	l.Debug.Printf("%d: got response %p", messageID, packet)
+	l.finishMessage(messageID)
 
 	if l.Debug {
 		if err := addLDAPDescriptions(packet); err != nil {
+			l.isStartingTLS = false
+			l.Close()
 			return err
 		}
 		ber.PrintPacket(packet)
@@ -151,16 +184,28 @@ func (l *Conn) StartTLS(config *tls.Config) error {
 
 	if packet.Children[1].Children[0].Value.(uint64) == 0 {
 		conn := tls.Client(l.conn, config)
+
+		if err := conn.Handshake(); err != nil {
+			l.isStartingTLS = false
+			l.Close()
+			return NewError(ErrorNetwork, fmt.Errorf("TLS handshake failed (%v)", err))
+		}
+
 		l.isTLS = true
 		l.conn = conn
 	}
+	go l.reader()
 
+	l.isStartingTLS = false
 	return nil
 }
 
 func (l *Conn) sendMessage(packet *ber.Packet) (chan *ber.Packet, error) {
 	if l.isClosing {
 		return nil, NewError(ErrorNetwork, errors.New("ldap: connection closed"))
+	}
+	if l.isStartingTLS {
+		return nil, NewError(ErrorNetwork, errors.New("ldap: connection is in startls phase."))
 	}
 	out := make(chan *ber.Packet)
 	message := &messagePacket{
@@ -232,9 +277,11 @@ func (l *Conn) processMessages() {
 					l.Debug.Printf("Error Sending Message: %s", err.Error())
 					break
 				}
+				l.incOutstandingRequests()
 			case MessageResponse:
 				l.Debug.Printf("Receiving message %d", messagePacket.MessageID)
 				if chanResult, ok := l.chanResults[messagePacket.MessageID]; ok {
+					l.decOutstandingRequests()
 					chanResult <- messagePacket.Packet
 				} else {
 					log.Printf("Received unexpected message %d", messagePacket.MessageID)
@@ -251,17 +298,31 @@ func (l *Conn) processMessages() {
 }
 
 func (l *Conn) reader() {
+	cleanstop := false
 	defer func() {
-		l.Close()
+		if !cleanstop {
+			l.Close()
+		}
 	}()
 
 	for {
+		if cleanstop {
+			l.Debug.Printf("reader clean stopping (without closing the connection)")
+			return
+		}
 		packet, err := ber.ReadPacket(l.conn)
 		if err != nil {
-			l.Debug.Printf("reader: %s", err.Error())
+			l.Debug.Printf("reader error: %s", err.Error())
 			return
 		}
 		addLDAPDescriptions(packet)
+		if len(packet.Children) == 0 {
+			l.Debug.Printf("Received bad ldap packet")
+			continue
+		}
+		if l.isStartingTLS {
+			cleanstop = true
+		}
 		message := &messagePacket{
 			Op:        MessageResponse,
 			MessageID: packet.Children[0].Value.(uint64),
